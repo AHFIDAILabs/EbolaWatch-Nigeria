@@ -39,3 +39,4 @@ pytest-asyncio>=0.23.0
 
 # Twitter reply dispatch
 twitter-api-client
+gradio>=4.44.0
