@@ -1,0 +1,274 @@
+import json
+import logging
+import re
+import time
+from typing import Optional
+
+import numpy as np
+
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Label order must match training — confirmed from model card
+# ---------------------------------------------------------------------------
+LABELS = ["factual", "misinformation", "irrelevant"]
+LABEL_TO_ID = {label: idx for idx, label in enumerate(LABELS)}
+
+# ---------------------------------------------------------------------------
+# Nigerian states for location extraction from post text
+# ---------------------------------------------------------------------------
+NIGERIAN_STATES = [
+    "Abia", "Adamawa", "Akwa Ibom", "Anambra", "Bauchi", "Bayelsa",
+    "Benue", "Borno", "Cross River", "Delta", "Ebonyi", "Edo", "Ekiti",
+    "Enugu", "Gombe", "Imo", "Jigawa", "Kaduna", "Kano", "Katsina",
+    "Kebbi", "Kogi", "Kwara", "Lagos", "Nasarawa", "Niger", "Ogun",
+    "Ondo", "Osun", "Oyo", "Plateau", "Rivers", "Sokoto", "Taraba",
+    "Yobe", "Zamfara", "FCT", "Abuja",
+]
+# Pre-compile pattern for performance
+_STATE_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(s) for s in NIGERIAN_STATES) + r")\b",
+    re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# Language code normalisation
+# Connectors may use different codes — normalise to API contract values
+# ---------------------------------------------------------------------------
+LANG_NORMALISE = {
+    "hau": "ha", "ibo": "ig", "yor": "yo",
+    "en": "en", "pcm": "pcm", "pcm_lexicon": "pcm",
+    "ha": "ha", "ig": "ig", "yo": "yo",
+}
+
+# ---------------------------------------------------------------------------
+# Nigerian language keyword detectors
+# Used when connector does not provide a reliable language code.
+# langdetect cannot distinguish Nigerian languages, so we use lexical cues.
+# ---------------------------------------------------------------------------
+_HA_RE = re.compile(
+    r'\b(gaskia|rigakafi|rigakafin|mallam|sannu|nagode|inshallah|yanzu|yau|jiya|'
+    r'lafiya|haba|karya|kowa|komai|hanya|birni|ruwa|abinci|zakar|wallahi|toh|barka|'
+    r'gida|mutane|sarki|masha|kasuwa|talaka|gwamnati|kasa|duniya|'
+    r'Allah ya|masha allah|ya allah|ya gafarta|ya jikan|ya taimaka|'
+    r'maganin|riga kafi|lafiyar|yara|jariri|cuta|asibiti|'
+    r'kuma|amma|sai|don|dai|wai|ya kamata|suna|namu|naka|'
+    r'lokaci|shekara|wata|kwana|mutum|aikin|kasar|'
+    r'cutar|rigakafin cutar|yanci|jama\'a|hukuma)\b',
+    re.IGNORECASE,
+)
+_YO_CHAR_RE = re.compile(r'[ọẹṣ]')
+_YO_WORD_RE = re.compile(
+    r'\b(naa|awon|fun|si|ati|tabi|ọlọrun|ẹjọwọ|nínú|wọn|'
+    r'eyi|yen|ni|ko|pe|ma|ti|lo|de|wi|bi|mu|ba|'
+    r'ajesara|egbogi|ile|omo|iya|baba|eniyan|ilu|ogun|arun|'
+    r'dara|buru|pelu|lati|sibẹ|ara|ẹ|àwọn|tí|fún|'
+    r'kò|wà|jẹ|rí|ṣe|àti|tàbí|nítorí|nígbà)\b',
+    re.IGNORECASE,
+)
+_IG_CHAR_RE = re.compile(r'[ụịọ]')
+_IG_WORD_RE = re.compile(
+    r'\b(nke|ndi|bụ|dị|nwere|ndị|maka|ihe|oge|ụlọ|chi|'
+    r'onye|anyị|gị|ọ bụ|ọ dị|ọ na|ọgwụ|oria|nne|nna|nwa|'
+    r'ezi|obodo|ala|mmadụ|nke a|nke ahụ|na-adị|'
+    r'adịghị|ọ bụ ezie|ụzọ|ọchịchọ|ikpe|ikike)\b',
+    re.IGNORECASE,
+)
+_PCM_RE = re.compile(
+    r'\b(dey|wetin|wahala|abeg|sabi|pikin|naija|una|vex|comot|oga|'
+    r'dem say|no be|e don|wey make|shele|beta|chop|hustle|'
+    r'e be like|na so|na wa|chai|tufiakwa|'
+    r'i no sabi|e no go|na im|na em|dis tin|dat one|'
+    r'how e take|wetin happen|e don do|dem dey|no dey)\b',
+    re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# Module-level singletons — loaded once at startup
+# ---------------------------------------------------------------------------
+_session = None      # onnxruntime.InferenceSession
+_tokenizer = None    # transformers tokenizer
+_thresholds = None   # dict of class biases
+_config = None       # model_config.json
+
+
+def load(onnx_path: str, thresholds_path: str,
+         config_path: str, tokenizer_repo: str,
+         hf_token: Optional[str] = None) -> None:
+    global _session, _tokenizer, _thresholds, _config
+
+    import onnxruntime as ort
+    from transformers import AutoTokenizer
+
+    log.info("Loading ONNX model: %s", onnx_path)
+    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    _session = ort.InferenceSession(onnx_path, providers=providers)
+
+    log.info("Loading tokenizer: %s", tokenizer_repo)
+    _tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_repo,
+        token=hf_token or None,
+    )
+
+    with open(thresholds_path) as f:
+        _thresholds = json.load(f)
+    log.info("Thresholds loaded: %s", _thresholds["class_biases"])
+
+    with open(config_path) as f:
+        _config = json.load(f)
+
+    log.info("Classifier ready.")
+
+
+def is_loaded() -> bool:
+    return all(x is not None for x in [_session, _tokenizer, _thresholds])
+
+
+def classify(text: str, language: Optional[str] = None,
+             location: Optional[str] = None) -> dict:
+    if not is_loaded():
+        raise RuntimeError("Classifier not loaded. Call load() at startup.")
+
+    t0 = time.perf_counter()
+    max_seq_len = _config.get("max_seq_len", 128)
+
+    # Tokenize
+    inputs = _tokenizer(
+        text,
+        return_tensors="np",
+        max_length=max_seq_len,
+        padding="max_length",
+        truncation=True,
+    )
+
+    # Run ONNX inference
+    logits = _session.run(
+        ["logits"],
+        {
+            "input_ids":      inputs["input_ids"].astype(np.int64),
+            "attention_mask": inputs["attention_mask"].astype(np.int64),
+        },
+    )[0][0]  # shape: (num_labels,)
+
+    # Apply per-class logit biases from thresholds.json
+    biases = _thresholds["class_biases"]
+    for label, bias in biases.items():
+        idx = LABEL_TO_ID.get(label)
+        if idx is not None:
+            logits[idx] += bias
+
+    # Softmax probabilities
+    exp_logits = np.exp(logits - logits.max())
+    probs = exp_logits / exp_logits.sum()
+
+    label_id = int(np.argmax(probs))
+    confidence = float(probs[label_id])
+
+    # Shannon entropy normalised to [0, 1] — Section 3.3.3
+    entropy_raw = float(-np.sum(probs * np.log(probs + 1e-9)))
+    entropy = round(entropy_raw / np.log(len(LABELS)), 4)
+
+    # Alternatives — other labels sorted by confidence
+    alternatives = [
+        {"label": LABELS[i], "confidence": round(float(probs[i]), 4)}
+        for i in np.argsort(probs)[::-1]
+        if i != label_id
+    ]
+
+    processing_ms = int((time.perf_counter() - t0) * 1000)
+
+    return {
+        "label":         LABELS[label_id],
+        "confidence":    round(confidence, 4),
+        "entropy":       entropy,
+        "alternatives":  alternatives,
+        "language":      _resolve_language(text, language),
+        "state":         _resolve_state(text, location),
+        "processing_ms": processing_ms,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Language resolution
+# ---------------------------------------------------------------------------
+def _resolve_language(text: str, provided: Optional[str]) -> Optional[str]:
+    if provided:
+        normed = LANG_NORMALISE.get(provided.lower(), provided.lower())
+        # Trust any explicitly-provided language code
+        if normed in ("ha", "yo", "ig", "pcm", "en"):
+            return normed
+
+    # Score each Nigerian language by keyword/character presence
+    ha_score  = len(_HA_RE.findall(text))
+    yo_score  = len(_YO_CHAR_RE.findall(text)) * 2 + len(_YO_WORD_RE.findall(text))
+    ig_score  = len(_IG_CHAR_RE.findall(text)) * 2 + len(_IG_WORD_RE.findall(text))
+    pcm_score = len(_PCM_RE.findall(text))
+
+    best_lang  = max(("ha", ha_score), ("yo", yo_score),
+                     ("ig", ig_score), ("pcm", pcm_score),
+                     key=lambda x: x[1])
+    if best_lang[1] >= 2:
+        return best_lang[0]
+
+    # Groq-based detection — handles all 5 languages reliably
+    groq_lang = _groq_detect_language(text)
+    if groq_lang:
+        return groq_lang
+
+    # langdetect fallback (optional dependency)
+    try:
+        from langdetect import detect
+        detected = detect(text)
+        return "en" if detected == "en" else None
+    except Exception:
+        pass
+
+    # Default to English for non-empty text — Nigerian Ebola content that
+    # scores below the Nigerian-language threshold is almost always English/PCM.
+    return "en" if text.strip() else None
+
+
+def _groq_detect_language(text: str) -> Optional[str]:
+    import os
+    groq_key = os.environ.get("GROQ_API_KEY", "")
+    if not groq_key:
+        return None
+    try:
+        from groq import Groq
+        client = Groq(api_key=groq_key)
+        resp = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Identify the language of the text below. "
+                    "Reply with ONLY one word — one of: en ha yo ig pcm unknown\n"
+                    "en=English  ha=Hausa  yo=Yoruba  ig=Igbo  pcm=Nigerian Pidgin\n\n"
+                    f"Text: {text[:300]}"
+                ),
+            }],
+            max_tokens=3,
+            temperature=0.0,
+        )
+        lang = resp.choices[0].message.content.strip().lower().split()[0]
+        return lang if lang in ("en", "ha", "yo", "ig", "pcm") else None
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# State extraction
+# ---------------------------------------------------------------------------
+def _resolve_state(text: str, provided: Optional[str]) -> Optional[str]:
+    if provided:
+        match = _STATE_PATTERN.search(provided)
+        if match:
+            state = match.group(1).title()
+            return "FCT" if state.lower() == "abuja" else state
+
+    match = _STATE_PATTERN.search(text)
+    if match:
+        state = match.group(1).title()
+        return "FCT" if state.lower() == "abuja" else state
+
+    return None

@@ -1,0 +1,222 @@
+import logging
+import os
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Callable, List, Optional
+
+import requests
+from dotenv import load_dotenv
+
+from src.ingestion.connectors.base import BaseConnector, RawPost, hash_author
+from src.ingestion.deduplication import Deduplicator
+
+load_dotenv()
+
+log = logging.getLogger(__name__)
+
+YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
+
+_ALLOWED_LANGUAGES = {"en", "ha", "yo", "ig", "pcm"}
+
+# Ebola search queries — English terms
+# covering Nigerian Ebola outbreak topics
+SEARCH_QUERIES = [
+    "Ebola Nigeria",
+    "Ebola virus Nigeria",
+    "EVD Nigeria",
+    "Ebola outbreak Nigeria",
+    "Ebola cure Nigeria",
+    "Ebola NCDC Nigeria",
+    "Lassa fever Nigeria",
+    "Ebola treatment Nigeria",
+]
+
+
+class YouTubeConnector(BaseConnector):
+
+    def __init__(self, on_post: Callable[[RawPost], None]):
+        super().__init__(on_post)
+        self.api_key       = os.environ.get("YOUTUBE_API_KEY", "")
+        self.poll_interval = int(os.environ.get("YOUTUBE_POLL_INTERVAL", 8100))
+        self._thread: Optional[threading.Thread] = None
+        self._dedup        = Deduplicator()
+
+        if not self.api_key:
+            log.warning("YOUTUBE_API_KEY not set — connector will not start")
+
+    def start(self) -> None:
+        if not self.api_key:
+            log.error("Cannot start YouTubeConnector — YOUTUBE_API_KEY missing")
+            return
+
+        self._running = True
+        self._thread  = threading.Thread(
+            target=self._poll_loop,
+            daemon=True,
+            name="youtube-connector",
+        )
+        self._thread.start()
+        log.info("YouTubeConnector started — polling every %ds", self.poll_interval)
+
+    def stop(self) -> None:
+        self._running = False
+        log.info("YouTubeConnector stopped.")
+
+    # ── Internal ─────────────────────────────────────────────────
+
+    def _poll_loop(self) -> None:
+        while self._running:
+            try:
+                self._poll_once()
+            except Exception as e:
+                log.error("YouTubeConnector poll error: %s", e)
+            time.sleep(self.poll_interval)
+
+    def _poll_once(self) -> None:
+        # Only process comments published in the last 24 hours so ingestion is
+        # continuous throughout the day rather than a single midnight burst when
+        # the 24h dedup TTL expires.
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        for query in SEARCH_QUERIES:
+            video_ids = self._search_videos(query)
+            for video_id in video_ids[:3]:  # top 3 per query — saves quota
+                comments = self._get_comments(video_id)
+                for item in comments:
+                    post = self._to_raw_post(item, video_id)
+                    if post is None:
+                        continue
+                    # commentThreads returns newest-first; stop at first old comment
+                    if post.timestamp < cutoff:
+                        break
+                    if not self._dedup.is_duplicate(
+                        post.post_id, post.content_text
+                    ):
+                        if post.language is not None \
+                                and post.language not in _ALLOWED_LANGUAGES:
+                            continue
+                        self._safe_on_post(post)
+
+    def _search_videos(self, query: str) -> List[str]:
+        try:
+            resp = requests.get(
+                f"{YOUTUBE_API_BASE}/search",
+                params={
+                    "key":           self.api_key,
+                    "q":             query,
+                    "type":          "video",
+                    "part":          "id",
+                    "maxResults":    10,
+                    "order":         "relevance",
+                    "videoEmbeddable": "true",
+                },
+                timeout=10,
+            )
+
+            if resp.status_code == 403:
+                reason = ""
+                try:
+                    errors = resp.json().get("error", {}).get("errors", [])
+                    reason = errors[0].get("reason", "") if errors else ""
+                except Exception:
+                    pass
+                if reason == "quotaExceeded":
+                    log.warning(
+                        "YouTubeConnector: quota exceeded — "
+                        "backing off for 6 hours"
+                    )
+                else:
+                    log.warning("YouTube search forbidden for '%s' (403 %s)", query, reason)
+                return []
+
+            resp.raise_for_status()
+            return [
+                item["id"]["videoId"]
+                for item in resp.json().get("items", [])
+            ]
+        except Exception as e:
+            log.warning("YouTube search failed for '%s': %s", query, e)
+            return []
+
+    def _get_comments(self, video_id: str) -> list:
+        try:
+            resp = requests.get(
+                f"{YOUTUBE_API_BASE}/commentThreads",
+                params={
+                    "key":        self.api_key,
+                    "videoId":    video_id,
+                    "part":       "snippet",
+                    "maxResults": 50,
+                    "order":      "time",
+                },
+                timeout=10,
+            )
+
+            if resp.status_code == 403:
+                # Parse the reason — commentsDisabled is expected and not an error
+                reason = ""
+                try:
+                    errors = resp.json().get("error", {}).get("errors", [])
+                    reason = errors[0].get("reason", "") if errors else ""
+                except Exception:
+                    pass
+
+                if reason == "commentsDisabled":
+                    log.debug("Comments disabled for video %s — skipping", video_id)
+                elif reason == "quotaExceeded":
+                    log.warning("YouTube API quota exceeded — pausing comment fetch")
+                else:
+                    log.debug("YouTube comments unavailable for video %s (403 %s)", video_id, reason)
+                return []
+
+            resp.raise_for_status()
+            return resp.json().get("items", [])
+
+        except requests.HTTPError as e:
+            log.debug("YouTube comments HTTP error for video %s: %s", video_id, e)
+            return []
+        except Exception as e:
+            log.warning("YouTube comments failed for video %s: %s", video_id, e)
+            return []
+
+    def _to_raw_post(self, item: dict, video_id: str) -> Optional[RawPost]:
+        try:
+            snippet    = item["snippet"]["topLevelComment"]["snippet"]
+            comment_id = item["id"]
+            content    = snippet.get("textOriginal", "").strip()
+
+            if not content or len(content) < 5:
+                return None
+
+            author_id     = snippet.get(
+                "authorChannelId", {}
+            ).get("value", comment_id)
+            author_handle = snippet.get("authorDisplayName", "")
+
+            ts_str = snippet.get("publishedAt", "")
+            try:
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            except Exception:
+                ts = datetime.now(timezone.utc)
+
+            return RawPost(
+                post_id=           comment_id,
+                platform=          "youtube",
+                content_text=      content,
+                content_type=      "TEXT",
+                author_hash=       hash_author(author_id),
+                language=          None,
+                timestamp=         ts,
+                ingestion_ts=      datetime.now(timezone.utc),
+                raw_url=           f"https://www.youtube.com/watch?v={video_id}",
+                # Channel country requires a separate channels.list API call
+                # (costs additional quota units). On free tier the classifier
+                # extracts state from the comment text as fallback.
+                location_raw=      None,
+                likes=             snippet.get("likeCount"),
+                shares=            None,
+                author_handle=     author_handle,
+            )
+        except Exception as e:
+            log.error("Failed to parse YouTube comment: %s", e)
+            return None

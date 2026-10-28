@@ -1,0 +1,59 @@
+name: Deploy to HuggingFace Spaces
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    branches: [main]
+    types: [completed]
+
+jobs:
+  deploy:
+    name: Upload to HuggingFace Spaces
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install huggingface_hub
+        run: pip install huggingface_hub
+
+      - name: Upload code to HuggingFace Spaces
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'EOF'
+          import os
+          from huggingface_hub import HfApi
+
+          token = os.environ.get("HF_TOKEN", "")
+          if not token:
+              raise SystemExit("HF_TOKEN secret is not set in GitHub repository settings.")
+
+          api = HfApi(token=token)
+          api.upload_folder(
+              folder_path=".",
+              repo_id="AHFIDAILabs/ebolawatch-ml-service",
+              repo_type="space",
+              commit_message="Deploy from GitHub Actions",
+              ignore_patterns=[
+                  "models/**", "venv/**", "__pycache__/**",
+                  "**/*.pyc", ".env", "data/**",
+                  "notebooks/**", "**/*.ipynb",
+                  ".pytest_cache/**", ".git/**",
+                  "temp_test.py", "docker-compose.yml",
+                  "deploy_to_hf.py",
+                  ".claude/**",
+                  "**/*.onnx", "**/*.onnx.data",
+                  "**/*.safetensors", "**/*.bin",
+                  "**/*.pt", "**/*.pkl",
+              ],
+          )
+          print("Deploy complete.")
+          EOF

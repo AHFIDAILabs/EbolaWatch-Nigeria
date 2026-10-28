@@ -1,0 +1,16 @@
+venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+.env
+/models/
+*.safetensors
+*.bin
+*.pt
+*.pkl
+notebooks/
+*.ipynb
+data/
+temp_test.py
+docker-compose.yml
+.claude/
